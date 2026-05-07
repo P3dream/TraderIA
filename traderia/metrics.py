@@ -4,7 +4,7 @@ import math
 import statistics
 
 from traderia.config import AgentConfig
-from traderia.models import Action, BenchmarkReturn, DecisionExplanation, EffectivenessReport
+from traderia.models import Action, AttributionRow, BenchmarkReturn, DecisionExplanation, EffectivenessReport
 from traderia.storage import SQLiteStore
 
 
@@ -57,6 +57,10 @@ def effectiveness_report(store: SQLiteStore, config: AgentConfig) -> Effectivene
     returns = _returns(values)
     benchmarks = benchmark_returns(store)
 
+    drawdown_abs = abs(max_drawdown)
+    annualised_return = (ending / config.starting_cash) ** (252 / max(1, len(values))) - 1
+    calmar = (annualised_return / drawdown_abs) if drawdown_abs > 0 else 0.0
+
     return EffectivenessReport(
         starting_cash=config.starting_cash,
         ending_value=ending,
@@ -68,8 +72,66 @@ def effectiveness_report(store: SQLiteStore, config: AgentConfig) -> Effectivene
         trades=len(trade_pnls),
         sharpe_ratio=_sharpe_ratio(returns),
         sortino_ratio=_sortino_ratio(returns),
+        calmar_ratio=calmar,
         benchmarks=benchmarks,
     )
+
+
+def attribution_report(store: SQLiteStore) -> list[AttributionRow]:
+    """Per-symbol, per-exit-type breakdown of P&L and signal strengths."""
+    rows = store.rows(
+        """
+        SELECT
+            o.symbol,
+            o.price AS exit_price,
+            o.quantity,
+            o.fees,
+            o.reason AS exit_reason,
+            b.price AS entry_price,
+            c.timing_score,
+            c.sentiment_score,
+            c.market_regime_score,
+            c.momentum
+        FROM orders o
+        JOIN orders b ON b.symbol = o.symbol AND b.action = 'BUY' AND b.status = 'FILLED'
+        LEFT JOIN market_contexts c ON c.symbol = o.symbol AND c.timestamp = o.timestamp
+        WHERE o.action = 'SELL' AND o.status = 'FILLED'
+        ORDER BY o.symbol, o.timestamp
+        """
+    )
+
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        symbol = str(row["symbol"])
+        reason = str(row["exit_reason"] or "")
+        exit_type = _classify_exit(reason)
+        key = (symbol, exit_type)
+        entry_px = float(row["entry_price"] or 0)
+        exit_px = float(row["exit_price"])
+        qty = int(row["quantity"])
+        fees = float(row["fees"])
+        pnl = (exit_px - entry_px) * qty - fees if entry_px else 0.0
+        buckets.setdefault(key, []).append({
+            "pnl": pnl,
+            "timing": float(row["timing_score"] or 0),
+            "sentiment": float(row["sentiment_score"] or 0),
+            "regime": float(row["market_regime_score"] or 0),
+            "momentum": float(row["momentum"] or 0),
+        })
+
+    result: list[AttributionRow] = []
+    for (symbol, exit_type), trades in sorted(buckets.items()):
+        result.append(AttributionRow(
+            symbol=symbol,
+            exit_type=exit_type,
+            trade_count=len(trades),
+            avg_pnl=statistics.fmean(t["pnl"] for t in trades),
+            avg_timing=statistics.fmean(t["timing"] for t in trades),
+            avg_sentiment=statistics.fmean(t["sentiment"] for t in trades),
+            avg_regime=statistics.fmean(t["regime"] for t in trades),
+            avg_momentum=statistics.fmean(t["momentum"] for t in trades),
+        ))
+    return result
 
 
 def benchmark_returns(store: SQLiteStore) -> tuple[BenchmarkReturn, ...]:
@@ -114,6 +176,94 @@ def benchmark_returns(store: SQLiteStore) -> tuple[BenchmarkReturn, ...]:
     return tuple(benchmarks)
 
 
+def decision_explanations(store: SQLiteStore, limit: int = 20, action: str | None = None) -> list[DecisionExplanation]:
+    params: list[object] = []
+    action_filter = ""
+    if action:
+        action_filter = "AND d.action = ?"
+        params.append(action.upper())
+    params.append(limit)
+
+    rows = store.rows(
+        f"""
+        SELECT
+            d.symbol,
+            d.timestamp,
+            d.action,
+            d.confidence,
+            d.quantity,
+            d.price,
+            d.expected_edge,
+            d.reason,
+            c.timing_score,
+            c.market_regime_score,
+            c.sentiment_score,
+            c.momentum,
+            c.volatility,
+            c.volume_ratio,
+            c.short_ma,
+            c.long_ma,
+            COALESCE(c.rsi, 50.0) AS rsi,
+            COALESCE(c.macd_histogram, 0.0) AS macd_histogram,
+            COALESCE(c.atr, 0.0) AS atr,
+            COALESCE(c.bb_pct, 0.5) AS bb_pct,
+            COALESCE(o.status, 'NO_ORDER') AS order_status,
+            COALESCE(o.reason, '') AS order_reason
+        FROM decisions d
+        LEFT JOIN market_contexts c
+            ON c.symbol = d.symbol
+            AND c.timestamp = d.timestamp
+        LEFT JOIN orders o
+            ON o.symbol = d.symbol
+            AND o.timestamp = d.timestamp
+            AND o.action = d.action
+            AND o.price = d.price
+        WHERE 1 = 1
+        {action_filter}
+        ORDER BY d.timestamp DESC, d.id DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+
+    explanations: list[DecisionExplanation] = []
+    for row in rows:
+        explanations.append(
+            DecisionExplanation(
+                symbol=str(row["symbol"]),
+                timestamp=_parse_timestamp(str(row["timestamp"])),
+                action=Action(str(row["action"])),
+                confidence=float(row["confidence"]),
+                quantity=int(row["quantity"]),
+                price=float(row["price"]),
+                expected_edge=float(row["expected_edge"]),
+                reason=str(row["reason"]),
+                timing_score=_float_or(row["timing_score"], 0.0),
+                market_regime_score=_float_or(row["market_regime_score"], 0.0),
+                sentiment_score=_float_or(row["sentiment_score"], 0.0),
+                momentum=_float_or(row["momentum"], 0.0),
+                volatility=_float_or(row["volatility"], 0.0),
+                volume_ratio=_float_or(row["volume_ratio"], 1.0),
+                short_ma=_float_or(row["short_ma"], 0.0),
+                long_ma=_float_or(row["long_ma"], 0.0),
+                rsi=_float_or(row["rsi"], 50.0),
+                macd_histogram=_float_or(row["macd_histogram"], 0.0),
+                atr=_float_or(row["atr"], 0.0),
+                bb_pct=_float_or(row["bb_pct"], 0.5),
+                order_status=str(row["order_status"]),
+                order_reason=str(row["order_reason"]),
+            )
+        )
+    return explanations
+
+
+def _classify_exit(reason: str) -> str:
+    for keyword in ("stop_loss", "trailing_stop", "take_profit", "momentum_breakdown", "negative_reversal", "growth_overlay_switch"):
+        if keyword in reason:
+            return keyword
+    return "signal"
+
+
 def _returns(values: list[float]) -> list[float]:
     return [(values[index] / values[index - 1]) - 1 for index in range(1, len(values)) if values[index - 1]]
 
@@ -149,84 +299,10 @@ def _sortino_ratio(returns: list[float]) -> float:
     return statistics.fmean(returns) / downside_deviation * math.sqrt(252)
 
 
-def decision_explanations(store: SQLiteStore, limit: int = 20, action: str | None = None) -> list[DecisionExplanation]:
-    params: list[object] = []
-    action_filter = ""
-    if action:
-        action_filter = "AND d.action = ?"
-        params.append(action.upper())
-    params.append(limit)
-
-    rows = store.rows(
-        f"""
-        SELECT
-            d.symbol,
-            d.timestamp,
-            d.action,
-            d.confidence,
-            d.quantity,
-            d.price,
-            d.expected_edge,
-            d.reason,
-            c.timing_score,
-            c.market_regime_score,
-            c.sentiment_score,
-            c.momentum,
-            c.volatility,
-            c.volume_ratio,
-            c.short_ma,
-            c.long_ma,
-            COALESCE(o.status, 'NO_ORDER') AS order_status,
-            COALESCE(o.reason, '') AS order_reason
-        FROM decisions d
-        LEFT JOIN market_contexts c
-            ON c.symbol = d.symbol
-            AND c.timestamp = d.timestamp
-        LEFT JOIN orders o
-            ON o.symbol = d.symbol
-            AND o.timestamp = d.timestamp
-            AND o.action = d.action
-            AND o.price = d.price
-        WHERE 1 = 1
-        {action_filter}
-        ORDER BY d.timestamp DESC, d.id DESC
-        LIMIT ?
-        """,
-        tuple(params),
-    )
-
-    explanations: list[DecisionExplanation] = []
-    for row in rows:
-        explanations.append(
-            DecisionExplanation(
-                symbol=str(row["symbol"]),
-                timestamp=_parse_timestamp(str(row["timestamp"])),
-                action=Action(str(row["action"])),
-                confidence=float(row["confidence"]),
-                quantity=int(row["quantity"]),
-                price=float(row["price"]),
-                expected_edge=float(row["expected_edge"]),
-                reason=str(row["reason"]),
-                timing_score=_float_or_zero(row["timing_score"]),
-                market_regime_score=_float_or_zero(row["market_regime_score"]),
-                sentiment_score=_float_or_zero(row["sentiment_score"]),
-                momentum=_float_or_zero(row["momentum"]),
-                volatility=_float_or_zero(row["volatility"]),
-                volume_ratio=_float_or_zero(row["volume_ratio"]),
-                short_ma=_float_or_zero(row["short_ma"]),
-                long_ma=_float_or_zero(row["long_ma"]),
-                order_status=str(row["order_status"]),
-                order_reason=str(row["order_reason"]),
-            )
-        )
-    return explanations
-
-
-def _float_or_zero(value: object) -> float:
-    return 0.0 if value is None else float(value)
+def _float_or(value: object, default: float) -> float:
+    return default if value is None else float(value)
 
 
 def _parse_timestamp(value: str):
     from datetime import datetime
-
     return datetime.fromisoformat(value)

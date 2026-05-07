@@ -27,6 +27,9 @@ class PaperTradingRunner:
         self.context_builder = ContextBuilder(config)
         self.agent = TradingAgent(config)
         self.agent.load_feedback(self.store.feedback_biases())
+        if config.use_kelly:
+            win_rate, avg_win, avg_loss = self.store.kelly_stats()
+            self.agent.load_kelly_stats(win_rate, avg_win, avg_loss)
         self.exposure_engine = ExposureEngine(config)
         self.broker = PaperBroker(config)
 
@@ -76,6 +79,10 @@ class PaperTradingRunner:
                         realized_return=realized_return,
                         note="closed paper position",
                     )
+                    # update Kelly stats incrementally when enabled
+                    if self.config.use_kelly:
+                        win_rate, avg_win, avg_loss = self.store.kelly_stats()
+                        self.agent.load_kelly_stats(win_rate, avg_win, avg_loss)
 
             if timestamp is not None:
                 self.store.save_snapshot(self.broker.snapshot(timestamp, prices))
@@ -233,7 +240,7 @@ class PaperTradingRunner:
             if len(bars) < self.config.market_regime_window:
                 continue
             closes = [bar.close for bar in bars]
-            regime_ma = statistics.fmean(closes[-self.config.market_regime_window :])
+            regime_ma = statistics.fmean(closes[-self.config.market_regime_window:])
             trend = (closes[-1] / regime_ma) - 1 if regime_ma else 0.0
             momentum_window = min(20, len(closes) - 1)
             momentum = (closes[-1] / closes[-momentum_window - 1]) - 1 if momentum_window > 0 else 0.0

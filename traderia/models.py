@@ -35,6 +35,10 @@ class MarketContext:
     sentiment_score: float
     timing_score: float
     market_regime_score: float = 0.0
+    rsi: float = 50.0
+    macd_histogram: float = 0.0
+    atr: float = 0.0
+    bb_pct: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,7 @@ class EffectivenessReport:
     trades: int
     sharpe_ratio: float = 0.0
     sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
     benchmarks: tuple["BenchmarkReturn", ...] = ()
 
 
@@ -121,3 +126,27 @@ class DecisionExplanation:
     long_ma: float
     order_status: str
     order_reason: str
+    rsi: float = 50.0
+    macd_histogram: float = 0.0
+    atr: float = 0.0
+    bb_pct: float = 0.5
+
+
+@dataclass(frozen=True)
+class AttributionRow:
+    symbol: str
+    exit_type: str
+    trade_count: int
+    avg_pnl: float
+    avg_timing: float
+    avg_sentiment: float
+    avg_regime: float
+    avg_momentum: float
+
+
+@dataclass(frozen=True)
+class WalkForwardFold:
+    fold: int
+    train_days: int
+    test_days: int
+    report: EffectivenessReport

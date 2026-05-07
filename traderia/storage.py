@@ -15,6 +15,8 @@ class SQLiteStore:
         self.migrate()
 
     def migrate(self) -> None:
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS market_contexts (
@@ -82,7 +84,14 @@ class SQLiteStore:
             );
             """
         )
-        self._ensure_column("market_contexts", "market_regime_score", "REAL NOT NULL DEFAULT 0.0")
+        for col, defn in [
+            ("market_regime_score", "REAL NOT NULL DEFAULT 0.0"),
+            ("rsi", "REAL NOT NULL DEFAULT 50.0"),
+            ("macd_histogram", "REAL NOT NULL DEFAULT 0.0"),
+            ("atr", "REAL NOT NULL DEFAULT 0.0"),
+            ("bb_pct", "REAL NOT NULL DEFAULT 0.5"),
+        ]:
+            self._ensure_column("market_contexts", col, defn)
         self.connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -95,8 +104,9 @@ class SQLiteStore:
             """
             INSERT INTO market_contexts (
                 symbol, timestamp, price, short_ma, long_ma, momentum,
-                volatility, volume_ratio, sentiment_score, timing_score, market_regime_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                volatility, volume_ratio, sentiment_score, timing_score,
+                market_regime_score, rsi, macd_histogram, atr, bb_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 context.symbol,
@@ -110,9 +120,12 @@ class SQLiteStore:
                 context.sentiment_score,
                 context.timing_score,
                 context.market_regime_score,
+                context.rsi,
+                context.macd_histogram,
+                context.atr,
+                context.bb_pct,
             ),
         )
-        self.connection.commit()
 
     def save_decision(self, decision: Decision) -> int:
         cursor = self.connection.execute(
@@ -132,7 +145,6 @@ class SQLiteStore:
                 decision.expected_edge,
             ),
         )
-        self.connection.commit()
         return int(cursor.lastrowid)
 
     def save_order(self, order: Order) -> None:
@@ -153,7 +165,6 @@ class SQLiteStore:
                 order.reason,
             ),
         )
-        self.connection.commit()
 
     def save_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         self.connection.execute(
@@ -178,7 +189,6 @@ class SQLiteStore:
             """,
             (timestamp, symbol, price, total_value),
         )
-        self.connection.commit()
 
     def save_feedback(self, timestamp: str, symbol: str, decision_id: int, realized_return: float, note: str) -> None:
         self.connection.execute(
@@ -204,6 +214,19 @@ class SQLiteStore:
             confidence = min(1.0, samples / 2)
             biases[str(row["symbol"])] = max(-1.0, min(1.0, float(row["avg_return"]) * 12 * confidence))
         return biases
+
+    def kelly_stats(self) -> tuple[float, float, float]:
+        """Returns (win_rate, avg_win, avg_loss) from feedback history."""
+        rows = self.rows("SELECT realized_return FROM feedback_events")
+        if not rows:
+            return 0.5, 0.01, 0.01
+        returns = [float(row["realized_return"]) for row in rows]
+        winners = [r for r in returns if r > 0]
+        losers = [abs(r) for r in returns if r < 0]
+        win_rate = len(winners) / len(returns)
+        avg_win = sum(winners) / len(winners) if winners else 0.01
+        avg_loss = sum(losers) / len(losers) if losers else 0.01
+        return win_rate, avg_win, avg_loss
 
     def reset_trading_history(self, clear_feedback: bool = True) -> None:
         self.connection.executescript(
